@@ -1,0 +1,117 @@
+#!/bin/bash
+# murmur — control the local Kokoro TTS daemon (murmurd)
+SOCK=/tmp/murmur.sock
+LOG="$HOME/.cache/murmurd.log"
+CFG="$HOME/.config/murmur/config.json"
+SELF_DIR="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
+
+send() {  # send raw payload to the daemon socket
+    python3 - "$1" <<'EOF'
+import socket, sys
+try:
+    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM); s.settimeout(2)
+    s.connect("/tmp/murmur.sock"); s.sendall(sys.argv[1].encode()); s.close()
+except Exception:
+    sys.exit(1)
+EOF
+}
+
+cfg_set() {  # cfg_set key value(json)
+    python3 - "$1" "$2" <<'EOF'
+import json, os, sys
+p = os.path.expanduser("~/.config/murmur/config.json")
+os.makedirs(os.path.dirname(p), exist_ok=True)
+try:
+    d = json.load(open(p))
+except Exception:
+    d = {}
+k, v = sys.argv[1], sys.argv[2]
+try:
+    v = json.loads(v)
+except Exception:
+    pass
+d[k] = v
+json.dump(d, open(p, "w"), indent=2)
+print(f"{k} = {v}")
+EOF
+}
+
+case "$1" in
+    on)
+        if pgrep -f '/murmurd$' >/dev/null; then
+            echo "murmur already running"
+        else
+            nohup "$SELF_DIR/murmurd" >"$LOG" 2>&1 &
+            disown
+            echo "murmur starting (log: $LOG)"
+        fi
+        ;;
+    off)      pkill -f '/murmurd$' && echo "murmur off" || echo "not running" ;;
+    say)      shift; send "$*" ;;
+    pause)    send "__PAUSE__" ;;
+    resume)   send "__RESUME__" ;;
+    toggle)   send "__TOGGLE__" ;;
+    hush|stop|skip) send "__STOP__" ;;
+    status)
+        if pgrep -f '/murmurd$' >/dev/null; then
+            python3 -c "import socket;s=socket.socket(socket.AF_UNIX,socket.SOCK_STREAM);s.settimeout(2);s.connect('$SOCK');s.sendall(b'__STATUS__');s.shutdown(socket.SHUT_WR);print(s.recv(4096).decode().strip());s.close()"
+        else echo '{"state":"stopped"}'; fi
+        ;;
+    voice)    shift; cfg_set voice "\"$1\"" ;;
+    speed)    shift; cfg_set speed "$1" ;;
+    duck)     shift; cfg_set duck "$1" ;;
+    voices)
+        # speak a sample line in each candidate voice so you can pick one
+        shift
+        LINE="${*:-This is the Murmur voice. The quick brown fox jumps over the lazy dog.}"
+        for v in am_michael am_adam am_onyx am_liam af_heart af_bella af_nicole af_sarah bm_george bf_emma; do
+            echo "  sampling: $v"
+            send "#voice=$v
+$v speaking. $LINE"
+            sleep 1
+        done
+        echo "Pick one, then: murmur voice <name>"
+        ;;
+    tray)     nohup "$SELF_DIR/murmur-tray" >>"$LOG" 2>&1 & disown; echo "tray launched" ;;
+    bar)      nohup "$SELF_DIR/murmur-bar" >>"$LOG" 2>&1 & disown; echo "bar launched" ;;
+    hotkey-install)
+        # bind Ctrl+Alt+Space -> murmur toggle  (Cinnamon)
+        BIN="$(command -v murmur || echo "$SELF_DIR/murmur")"
+        python3 - "$BIN" <<'EOF'
+import subprocess, sys, ast
+BIN = sys.argv[1]
+G = "org.cinnamon.desktop.keybindings"
+def get(k): return subprocess.check_output(["gsettings","get",G,k]).decode().strip()
+lst = ast.literal_eval(get("custom-list"))
+name = "murmur-toggle"
+if name not in lst:
+    lst = [x for x in lst if x != "__dummy__"] + [name, "__dummy__"]
+    subprocess.run(["gsettings","set",G,"custom-list",str(lst)])
+path = f"custom-keybindings/{name}/"
+S = f"{G}.custom-keybinding:/org/cinnamon/desktop/keybindings/{path}"
+subprocess.run(["gsettings","set",S,"name","Murmur toggle pause"])
+subprocess.run(["gsettings","set",S,"command",f"{BIN} toggle"])
+subprocess.run(["gsettings","set",S,"binding","['<Control><Alt>space']"])
+print("bound Ctrl+Alt+Space -> murmur toggle")
+EOF
+        ;;
+    *)
+        cat <<EOF
+usage: murmur <command>
+
+  on | off            start / stop the daemon (voice on/off)
+  say <text>          speak text
+  pause | resume      pause / resume playback
+  toggle              toggle pause (used by the hotkey + bar)
+  hush | skip         stop current + clear the queue
+  status              JSON state
+  voice <name>        set default voice (persists)
+  speed <x>           set speed, e.g. 1.10
+  duck <pct>          music volume while speaking, e.g. 25
+  voices [line]       sample every candidate voice out loud
+  tray                launch the taskbar tray icon (recommended)
+  bar                 launch the always-on-top mini bar (alternative)
+  hotkey-install      bind Ctrl+Alt+Space -> toggle (Cinnamon)
+EOF
+        ;;
+esac

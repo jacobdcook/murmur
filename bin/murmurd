@@ -1,0 +1,285 @@
+#!/usr/bin/env python3
+"""murmurd — local Kokoro TTS daemon.
+
+Loads the Kokoro model once and speaks any text sent to its unix socket.
+Features:
+  - streaming playback: speaks each sentence/segment as soon as it is
+    synthesized, so the first audio starts in ~1s even for long replies.
+  - real pause / resume (not just stop) via a callback-driven OutputStream.
+  - music ducking: lowers every other PulseAudio stream while speaking and
+    restores it when idle.
+  - runtime config from ~/.config/murmur/config.json (voice, speed, duck).
+
+Socket protocol (connect, send UTF-8, close):
+  plain text            -> speak it (with the default voice)
+  "#voice=NAME\\n<text>"  -> speak <text> with a specific voice (one-off)
+  __PAUSE__ / __RESUME__ / __TOGGLE__   -> pause control
+  __STOP__              -> skip current utterance + clear the queue
+  __STATUS__            -> daemon writes back one JSON line, then closes
+"""
+import json
+import os
+import queue
+import re
+import socket
+import subprocess
+import threading
+
+SOCK = "/tmp/murmur.sock"
+CONFIG = os.path.expanduser("~/.config/murmur/config.json")
+SAMPLE_RATE = 24_000
+MAX_CHARS = 6000
+
+DEFAULTS = {"voice": "am_michael", "speed": 1.10, "duck": 25}
+
+
+def load_config():
+    cfg = dict(DEFAULTS)
+    try:
+        with open(CONFIG) as f:
+            cfg.update(json.load(f))
+    except Exception:
+        pass
+    return cfg
+
+
+print("murmurd: loading Kokoro…", flush=True)
+from kokoro import KPipeline
+import numpy as np
+import sounddevice as sd
+
+pipe = KPipeline(lang_code="a")
+
+
+# ── music ducking ─────────────────────────────────────────────────────────
+class Ducker:
+    """Lower every other PulseAudio stream while we speak, restore after."""
+
+    def __init__(self):
+        self.saved = {}
+        self.pid = str(os.getpid())
+
+    def _sink_inputs(self):
+        out = []
+        try:
+            raw = subprocess.run(
+                ["pactl", "list", "sink-inputs"],
+                capture_output=True, text=True, timeout=2,
+            ).stdout
+        except Exception:
+            return out
+        cur = {}
+        for line in raw.splitlines():
+            m = re.match(r"Sink Input #(\d+)", line)
+            if m:
+                if cur:
+                    out.append(cur)
+                cur = {"id": m.group(1), "pid": None, "vol": None}
+            elif "application.process.id" in line:
+                mm = re.search(r'"(\d+)"', line)
+                if mm:
+                    cur["pid"] = mm.group(1)
+            elif line.strip().startswith("Volume:") and cur.get("vol") is None:
+                mm = re.search(r"(\d+)%", line)
+                if mm:
+                    cur["vol"] = int(mm.group(1))
+        if cur:
+            out.append(cur)
+        return out
+
+    def duck(self, pct):
+        for si in self._sink_inputs():
+            if si["pid"] == self.pid or si["id"] in self.saved:
+                continue
+            if si["vol"] is None:
+                continue
+            self.saved[si["id"]] = si["vol"]
+            try:
+                subprocess.run(
+                    ["pactl", "set-sink-input-volume", si["id"], f"{pct}%"],
+                    timeout=2,
+                )
+            except Exception:
+                pass
+
+    def restore(self):
+        for sid, vol in list(self.saved.items()):
+            try:
+                subprocess.run(
+                    ["pactl", "set-sink-input-volume", sid, f"{vol}%"],
+                    timeout=2,
+                )
+            except Exception:
+                pass
+        self.saved.clear()
+
+
+# ── playback engine ───────────────────────────────────────────────────────
+class Engine:
+    def __init__(self):
+        self.q = queue.Queue()
+        self.lock = threading.Lock()
+        self.buf = None
+        self.pos = 0
+        self.paused = False
+        self.skip = False
+        self.speaking = False
+        self.current = ""
+        self.ducker = Ducker()
+        threading.Thread(target=self._worker, daemon=True).start()
+
+    # public control
+    def enqueue(self, text, voice=None):
+        self.q.put((text, voice))
+
+    def pause(self):
+        with self.lock:
+            self.paused = True
+
+    def resume(self):
+        with self.lock:
+            self.paused = False
+
+    def toggle(self):
+        with self.lock:
+            self.paused = not self.paused
+            return self.paused
+
+    def stop(self):
+        # skip current utterance and drop the whole queue
+        try:
+            while True:
+                self.q.get_nowait()
+        except queue.Empty:
+            pass
+        with self.lock:
+            self.skip = True
+            self.paused = False
+
+    def status(self):
+        with self.lock:
+            state = "paused" if self.paused else ("speaking" if self.speaking else "idle")
+            return {
+                "state": state,
+                "queued": self.q.qsize(),
+                "text": self.current[:120],
+            }
+
+    # internals
+    def _callback(self, outdata, frames, time_info, status):
+        with self.lock:
+            if self.skip or self.buf is None:
+                outdata[:] = 0
+                raise sd.CallbackStop
+            if self.paused:
+                outdata[:] = 0
+                return
+            end = self.pos + frames
+            chunk = self.buf[self.pos:end]
+            n = len(chunk)
+            outdata[:n, 0] = chunk
+            if n < frames:
+                outdata[n:, 0] = 0
+                self.pos = len(self.buf)
+                raise sd.CallbackStop
+            self.pos = end
+
+    def _play(self, audio):
+        if hasattr(audio, "detach"):  # torch.Tensor -> numpy
+            audio = audio.detach().cpu().numpy()
+        audio = np.asarray(audio, dtype="float32").reshape(-1)
+        with self.lock:
+            self.buf = audio
+            self.pos = 0
+        done = threading.Event()
+        stream = sd.OutputStream(
+            samplerate=SAMPLE_RATE, channels=1,
+            callback=self._callback,
+            finished_callback=done.set,
+        )
+        with stream:
+            done.wait()
+        with self.lock:
+            self.buf = None
+
+    def _worker(self):
+        while True:
+            text, voice = self.q.get()
+            cfg = load_config()
+            voice = voice or cfg["voice"]
+            speed = cfg["speed"]
+            with self.lock:
+                self.skip = False
+                self.speaking = True
+                self.current = text
+            try:
+                self.ducker.duck(cfg["duck"])
+                for _, _, audio in pipe(text, voice=voice, speed=speed):
+                    with self.lock:
+                        if self.skip:
+                            break
+                    if audio is not None and len(audio):
+                        self._play(audio)
+            except Exception as e:
+                print(f"murmurd: playback error: {e}", flush=True)
+            finally:
+                with self.lock:
+                    self.speaking = False
+                    self.current = ""
+                # only un-duck once nothing else is waiting
+                if self.q.empty():
+                    self.ducker.restore()
+
+
+engine = Engine()
+
+
+# ── socket server ─────────────────────────────────────────────────────────
+if os.path.exists(SOCK):
+    os.remove(SOCK)
+srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+srv.bind(SOCK)
+os.chmod(SOCK, 0o600)
+srv.listen(16)
+print("murmurd: ready", flush=True)
+
+while True:
+    conn, _ = srv.accept()
+    data = b""
+    try:
+        while True:
+            b = conn.recv(65536)
+            if not b:
+                break
+            data += b
+    except Exception:
+        conn.close()
+        continue
+    text = data.decode("utf-8", "ignore").strip()
+    if not text:
+        conn.close()
+        continue
+
+    if text == "__STATUS__":
+        try:
+            conn.sendall((json.dumps(engine.status()) + "\n").encode())
+        except Exception:
+            pass
+        conn.close()
+        continue
+
+    conn.close()
+
+    if text == "__PAUSE__":
+        engine.pause()
+    elif text == "__RESUME__":
+        engine.resume()
+    elif text == "__TOGGLE__":
+        engine.toggle()
+    elif text == "__STOP__":
+        engine.stop()
+    elif text.startswith("#voice="):
+        first, _, rest = text.partition("\n")
+        engine.enqueue(rest.strip()[:MAX_CHARS], voice=first[len("#voice="):].strip())
+    else:
+        engine.enqueue(text[:MAX_CHARS])

@@ -1,82 +1,99 @@
-# jarvis-voice — end-to-end flow
+# Murmur — end-to-end flow
 
 ## The loop
 
 ```
-                    YOU
-                     |
-   hold `  (GRAVE)   |   hear reply
-        v            |        ^
-   +---------+       |   +----------+
-   | voxflow |       |   | jarvisd  |  Kokoro TTS daemon (GPU)
-   | Whisper |       |   | am_michael, 1.10x
-   +----+----+       |   +----+-----+
-        |            |        ^  plays on default audio sink
-        | types text |        |
-        | into prompt|        | UTF-8 text over unix socket
-        v            |        |  /tmp/jarvis.sock
-   +---------------------------+---+
-   |        Claude Code            |
-   |  turn ends -> Stop hook fires |
-   |  jarvis-speak.py              |
-   +-------------------------------+
+                         YOU
+                          |
+   push-to-talk (Whisper) |   hear reply (ducked over music)
+        v                 |            ^
+   +-----------+          |     +--------------+
+   | dictation |          |     |   murmurd    |  Kokoro TTS daemon (GPU)
+   | -> text   |          |     |  streaming   |  speaks sentence-by-sentence
+   +-----+-----+          |     +------+-------+
+         | types into     |            ^  plays on default sink; ducks others
+         | the prompt     |            |
+         v                |            |  UTF-8 / control over unix socket
+   +---------------------------+-------+---+       /tmp/murmur.sock
+   |          Claude Code                  |          ^        ^
+   |  turn ends -> Stop hook fires         |          |        |
+   |  murmur-speak.py -> socket            |     murmur-tray  Ctrl+Alt+Space
+   +---------------------------------------+     (taskbar)    -> murmur toggle
 ```
 
-## Input side (already installed, not part of this repo)
+## Components
 
-- `voxflow` autostarts at login (`~/.config/autostart/voxflow.desktop`).
-- Hold **`** (GRAVE, keycode 49) to dictate; release to insert text.
-- Config: `~/.config/mintflow/config.json` — Whisper `large-v3`, `device: cuda`,
-  ollama `qwen2.5:14b` cleanup pass, hotkey `keycode:49`.
-- This repo does not touch voxflow. It only adds the spoken-output half.
+### `murmurd` — the daemon (`bin/murmurd`)
 
-## Output side (this repo)
+- Loads Kokoro `KPipeline` once (~15-20s; logs `murmurd: ready` to
+  `~/.cache/murmurd.log`).
+- Binds `/tmp/murmur.sock` (0600, user-only).
+- **Streaming**: iterates the segments Kokoro yields for the text and plays each
+  the moment it's synthesized, so first audio is ~1s even for long replies.
+- **Playback** uses a callback-driven `sounddevice.OutputStream`, which is what
+  makes real pause/resume possible (the callback emits silence while paused and
+  resumes from the same position — the stream is never torn down).
+- **Ducking**: on speech start it lowers every *other* PulseAudio sink-input
+  (matched by process id, so it never ducks itself) to `duck`% and restores the
+  saved levels once the queue drains.
+- **Config**: re-reads `~/.config/murmur/config.json` before each utterance, so
+  `voice` / `speed` / `duck` changes take effect on the next line without a
+  restart. Env `MURMUR_*` is not needed — everything is in the config file.
 
-### 1. `jarvisd` — the daemon (`bin/jarvisd`)
-
-- On start: loads Kokoro `KPipeline(lang_code='a')` once (~10-20s, prints
-  `jarvisd: ready` to `~/.cache/jarvisd.log`).
-- Binds unix socket `/tmp/jarvis.sock` (mode 0600).
-- A background player thread pulls text off a queue, synthesizes with
-  `voice=am_michael, speed=1.10`, plays via `sounddevice` on the default sink.
-- Socket protocol: connect, send UTF-8 text, close. Text is queued and spoken.
-- Special payload `__STOP__`: drains the queue and calls `sd.stop()` (this is
-  what `jarvis hush` sends).
-- Env overrides read at start: `JARVIS_VOICE`, `JARVIS_SPEED`.
-- Text is capped at 3000 chars per message.
-
-### 2. `jarvis` — the control CLI (`bin/jarvis`)
+### `murmur` — the CLI (`bin/murmur`)
 
 | Command | Action |
 | --- | --- |
-| `jarvis on` | `nohup jarvisd` if not already running; logs to `~/.cache/jarvisd.log` |
-| `jarvis off` | `pkill -f '/jarvisd$'` |
-| `jarvis say TEXT` | opens socket, sends TEXT |
-| `jarvis hush` | sends `__STOP__` |
-| `jarvis status` | `running` / `stopped` |
+| `on` / `off` | start / stop the daemon |
+| `say <text>` | speak text |
+| `pause` / `resume` / `toggle` | pause control (hotkey + tray use `toggle`) |
+| `skip` (aka `hush`/`stop`) | abandon current utterance + clear the queue |
+| `status` | JSON: `{state, queued, text}` |
+| `voice <name>` / `speed <x>` / `duck <pct>` | persist a config value |
+| `voices [line]` | speak a sample line in each candidate voice |
+| `tray` / `bar` | launch the taskbar icon / the floating mini bar |
+| `hotkey-install` | bind `Ctrl+Alt+Space` -> `murmur toggle` (Cinnamon) |
 
-"Voice on/off" == "daemon up/down". When the daemon is down, the Stop hook's
-socket connect fails and it silently no-ops — so leaving the hook installed costs
-nothing when you don't want voice.
+Voice on/off == daemon up/down. With the daemon down, the Stop hook's socket
+connect fails and it no-ops.
 
-### 3. `jarvis-speak.py` — the Claude Code Stop hook (`hooks/jarvis-speak.py`)
+### `murmur-tray` — taskbar icon (`bin/murmur-tray`)
 
-Fires when a Claude turn ends. Claude Code passes the hook a JSON blob on stdin
-containing `transcript_path`. The hook:
+AppIndicator (Cinnamon/GNOME tray). Label shows live state (`▮▮ speaking`,
+`▶ paused`, `· idle`, `○ off`). Menu: Pause/Resume, Skip, a **Voice** submenu that
+switches voice live, and Quit. Polls `__STATUS__` every 0.7s.
 
-1. Reads the transcript JSONL, walks it, keeps the **last** `assistant` entry that
-   has a non-empty text block (so tool-only turns and earlier messages are
-   skipped — only the final spoken reply plays).
-2. Cleans the markdown for speech: strips code fences (replaced with the phrase
-   "Code block."), headings, link URLs, table rows, `**`, backticks, list
-   bullets; collapses whitespace.
-3. Caps at 3000 chars, opens `/tmp/jarvis.sock`, sends the text, closes.
-4. Any error (daemon down, no transcript, parse fail) -> silent return. Never
-   blocks or errors the turn.
+### `murmur-bar` — floating mini bar (`bin/murmur-bar`)
 
-## Wiring the hook into Claude Code
+Alternative to the tray: a small always-on-top, top-left GTK strip with a
+pause/resume button, a skip button, a state dot, and the current-text readout.
+Use it if you'd rather have a visible widget than a tray icon.
 
-Add to `~/.claude/settings.json` under `hooks`:
+### `murmur-speak.py` — the Claude Code Stop hook (`hooks/murmur-speak.py`)
+
+Fires when a turn ends. Reads `transcript_path` from the hook's stdin JSON, takes
+the **last** assistant text block, strips markdown/code fences for speech, caps at
+6000 chars, and sends it to the socket. Any failure -> silent return (never blocks
+a turn).
+
+## Socket protocol
+
+Connect to `/tmp/murmur.sock`, send UTF-8, close:
+
+| Payload | Meaning |
+| --- | --- |
+| plain text | speak with the default voice |
+| `#voice=NAME\n<text>` | speak `<text>` with a one-off voice |
+| `__PAUSE__` / `__RESUME__` / `__TOGGLE__` | pause control |
+| `__STOP__` | skip current + clear queue |
+| `__STATUS__` | daemon writes one JSON line back, then closes |
+
+Clients that want the `__STATUS__` reply must `shutdown(SHUT_WR)` after sending so
+the daemon sees end-of-input before it replies.
+
+## Wiring the Stop hook
+
+`~/.claude/settings.json`:
 
 ```json
 "Stop": [
@@ -84,10 +101,10 @@ Add to `~/.claude/settings.json` under `hooks`:
     "hooks": [
       {
         "type": "command",
-        "command": "python3 \"/home/z1337/.claude/hooks/jarvis-speak.py\"",
+        "command": "python3 \"/home/YOU/.claude/hooks/murmur-speak.py\"",
         "timeout": 5,
         "async": true,
-        "statusMessage": "Jarvis speaking..."
+        "statusMessage": "Murmur speaking..."
       }
     ]
   }
@@ -97,31 +114,27 @@ Add to `~/.claude/settings.json` under `hooks`:
 `async: true` so synthesis never blocks the next prompt. After editing settings
 mid-session, open `/hooks` once or restart Claude Code so the watcher reloads.
 
-## Daily use
+## Global hotkey
 
-```bash
-jarvis on          # after boot, when you want voice
-# ... work in Claude Code; every reply is spoken ...
-jarvis hush        # shut it up mid-sentence
-jarvis off         # done for the day
-```
+`murmur hotkey-install` registers a Cinnamon custom keybinding
+(`Ctrl+Alt+Space` -> `murmur toggle`). On other desktops, bind that command to any
+key via your DE's keyboard settings — `murmur toggle` is all it runs.
 
 ## Troubleshooting
 
 | Symptom | Check |
 | --- | --- |
-| No audio at all | `jarvis status` (is it running?), then `jarvis say test` |
-| Daemon "running" but silent | `pactl get-default-sink` — Kokoro plays to the default sink; switch sink or restart daemon after changing it |
-| Hook not firing this session | settings changed mid-session — open `/hooks` once or restart Claude Code |
-| Model won't load | `tail ~/.cache/jarvisd.log`; confirm `python3 -c "import kokoro, sounddevice, soundfile, numpy"` for your user |
-| Wrong voice/speed | `JARVIS_VOICE=af_heart JARVIS_SPEED=1.0 jarvis on` |
+| No audio | `murmur status`; `tail ~/.cache/murmurd.log` for a stack trace |
+| `'Tensor' object has no attribute 'astype'` | old build — update; segments are torch tensors and must be converted before playback |
+| Speaking but silent | `pactl get-default-sink` — daemon plays to the default sink |
+| Music not ducking | confirm `pactl` works and the other app is a normal sink-input |
+| Hook not firing this session | settings changed mid-session — open `/hooks` or restart |
+| Tray icon missing | need `gir1.2-appindicator3-0.1` (or Ayatana); check `/tmp` tray log |
 
 ## Design decisions
 
-- **No autostart.** Deliberate — a prior autostart script on this machine caused a
-  hardware incident, so voice is opt-in per boot.
-- **Daemon, not per-call TTS.** Kokoro's model load is the expensive part; loading
-  once and holding it in a resident process makes each reply near-instant.
-- **Unix socket, 0600.** Local-only, user-only; no network surface.
-- **Fail-silent hook.** The hook must never break a Claude turn, so every failure
-  path returns quietly.
+- **Daemon, not per-call TTS.** Kokoro's model load is the cost; hold it resident.
+- **Callback OutputStream.** Only way to get resumable pause without re-synth.
+- **Duck by process id.** Reliable self-exclusion; no fragile name matching.
+- **Fail-silent hook.** Must never break a Claude turn.
+- **No autostart by default.** Opt-in per machine.

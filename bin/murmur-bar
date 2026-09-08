@@ -1,0 +1,108 @@
+#!/usr/bin/env python3
+"""murmur-bar — tiny always-on-top control strip for murmurd.
+
+Pinned top-left, no decorations, above other windows, out of the taskbar.
+Pause/resume + skip buttons and a live status readout, like a mini media bar.
+Polls the daemon over its unix socket.
+"""
+import json
+import socket
+
+import gi
+
+gi.require_version("Gtk", "3.0")
+from gi.repository import GLib, Gtk, Gdk  # noqa: E402
+
+SOCK = "/tmp/murmur.sock"
+
+
+def talk(payload, want_reply=False):
+    try:
+        s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        s.settimeout(1.5)
+        s.connect(SOCK)
+        s.sendall(payload.encode())
+        if want_reply:
+            s.shutdown(socket.SHUT_WR)
+            data = s.recv(4096).decode().strip()
+            s.close()
+            return data
+        s.close()
+    except Exception:
+        return None
+
+
+class Bar(Gtk.Window):
+    def __init__(self):
+        super().__init__(title="Murmur")
+        self.set_decorated(False)
+        self.set_keep_above(True)
+        self.set_skip_taskbar_hint(True)
+        self.set_skip_pager_hint(True)
+        self.set_resizable(False)
+        self.stick()
+        self.set_type_hint(Gdk.WindowTypeHint.UTILITY)
+        self.set_gravity(Gdk.Gravity.NORTH_WEST)
+        self.move(12, 8)
+
+        box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        box.set_margin_top(4)
+        box.set_margin_bottom(4)
+        box.set_margin_start(8)
+        box.set_margin_end(8)
+        self.add(box)
+
+        self.dot = Gtk.Label(label="●")
+        self.btn_toggle = Gtk.Button(label="⏸")
+        self.btn_skip = Gtk.Button(label="⏭")
+        self.status = Gtk.Label(label="idle")
+        self.status.set_max_width_chars(40)
+        self.status.set_ellipsize(3)  # PANGO_ELLIPSIZE_END
+
+        self.btn_toggle.connect("clicked", lambda *_: talk("__TOGGLE__"))
+        self.btn_skip.connect("clicked", lambda *_: talk("__STOP__"))
+
+        for w in (self.dot, self.btn_toggle, self.btn_skip, self.status):
+            box.pack_start(w, False, False, 0)
+
+        css = Gtk.CssProvider()
+        css.load_from_data(b"""
+            window { background-color: #14161c; border-radius: 10px; }
+            label  { color: #d7dbe4; font-family: monospace; font-size: 12px; }
+            button { padding: 0 8px; min-height: 22px; background: #232733;
+                     color: #d7dbe4; border: none; border-radius: 6px; }
+            button:hover { background: #333a4a; }
+        """)
+        Gtk.StyleContext.add_provider_for_screen(
+            Gdk.Screen.get_default(), css,
+            Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION,
+        )
+
+        self.connect("destroy", Gtk.main_quit)
+        GLib.timeout_add(600, self._poll)
+
+    def _poll(self):
+        reply = talk("__STATUS__", want_reply=True)
+        if reply is None:
+            self.dot.set_text("○")
+            self.status.set_text("daemon off")
+            self.btn_toggle.set_label("⏸")
+            return True
+        try:
+            st = json.loads(reply)
+        except Exception:
+            return True
+        state = st.get("state", "idle")
+        colors = {"speaking": "#5ac57a", "paused": "#e0b341",
+                  "idle": "#5b6272", "stopped": "#8a3b3b"}
+        self.dot.set_markup(f'<span foreground="{colors.get(state, "#5b6272")}">●</span>')
+        self.btn_toggle.set_label("▶" if state == "paused" else "⏸")
+        txt = st.get("text", "").strip()
+        self.status.set_text(txt if txt else state)
+        return True
+
+
+if __name__ == "__main__":
+    win = Bar()
+    win.show_all()
+    Gtk.main()

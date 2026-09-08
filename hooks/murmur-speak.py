@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
-"""Claude Code Stop hook: send the last assistant message to the jarvisd
+"""Claude Code Stop hook: send the last assistant message to the murmurd
 Kokoro TTS daemon. Fails silently if the daemon is not running, so
-`jarvis on` / `jarvis off` is the voice toggle."""
+`murmur on` / `murmur off` is the voice toggle."""
 import json
 import re
 import socket
 import sys
 
-SOCK = "/tmp/jarvis.sock"
-MAX_CHARS = 3000
+SOCK = "/tmp/murmur.sock"
+MAX_CHARS = 6000
 
 
 def clean(text):

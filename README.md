@@ -1,62 +1,72 @@
-# jarvis-voice
+# Murmur
 
-Local, GPU-backed voice loop for Claude Code (and any CLI). Talk in by holding a
-key; hear Claude's replies spoken back through a Kokoro TTS daemon running on the
-GPU. No cloud TTS, no per-word latency after the model is warm.
+Local, GPU-backed voice for [Claude Code](https://claude.com/claude-code) (and any
+CLI). Hear Claude's replies spoken aloud by a resident [Kokoro](https://github.com/hexgrad/kokoro)
+TTS daemon — it **murmurs under your music** (ducks other audio while it talks),
+starts speaking in about a second even on long replies, and gives you a taskbar
+icon plus a global hotkey to pause, resume, and skip. No cloud TTS.
 
-- **Input** (already on this machine): `voxflow` — hold **`** (backtick / GRAVE)
-  to dictate. Whisper `large-v3` on CUDA, cleaned up by a local ollama model.
-- **Output** (this repo): `jarvisd`, a Kokoro TTS daemon that loads the model
-  once and speaks any text sent to its unix socket. A Claude Code **Stop hook**
-  feeds it Claude's last message after every turn.
+Pair it with any push-to-talk dictation tool (the author uses
+[voxflow](https://github.com/jacobdcook)/Whisper on a hotkey) and you have a full
+spoken conversation loop with your terminal.
 
-Toggle the whole thing with `jarvis on` / `jarvis off`. Daemon running = voice on.
+![state: idle | speaking | paused](https://img.shields.io/badge/tray-idle%20%7C%20speaking%20%7C%20paused-blue)
 
-See [FLOW.md](FLOW.md) for the end-to-end data flow and troubleshooting.
+## What you get
 
-## Layout
-
-| Path | Installs to | What it is |
-| --- | --- | --- |
-| `bin/jarvisd` | `~/.local/bin/jarvisd` | Kokoro daemon; unix socket `/tmp/jarvis.sock` |
-| `bin/jarvis` | `~/.local/bin/jarvis` | Control CLI: `on\|off\|say\|hush\|status` |
-| `hooks/jarvis-speak.py` | `~/.claude/hooks/jarvis-speak.py` | Claude Code Stop hook |
+- **Streaming playback** — speaks each sentence as it's synthesized, so the first
+  words start in ~1s instead of after the whole reply is rendered.
+- **Music ducking** — lowers every other PulseAudio/PipeWire stream to 25% while
+  speaking, restores it when done.
+- **Real pause / resume** — not just stop. Hold a thought, reply, resume.
+- **Global hotkey** — `Ctrl+Alt+Space` toggles pause (Cinnamon; scriptable).
+- **Taskbar tray icon** — live state + a menu for pause/skip/voice switching,
+  like a media applet. (An always-on-top mini bar is included as an alternative.)
+- **Voice auditioning** — `murmur voices` speaks a sample line in each candidate
+  voice so you can pick, then `murmur voice <name>` sets it.
 
 ## Install
 
 ```bash
-git clone git@github.com:jacobdcook/jarvis-voice.git
-cd jarvis-voice
+git clone https://github.com/jacobdcook/murmur.git
+cd murmur
 ./install.sh
 ```
 
-Then register the Stop hook in `~/.claude/settings.json` (see FLOW.md), start the
-daemon, and go:
+Requirements: Python 3.12 with `kokoro`, `sounddevice`, `soundfile`, `numpy`
+installed **for your user** (not a venv — the daemon plays to your default audio
+device). For the tray/bar: `python3-gi` with GTK 3, and `gir1.2-appindicator3`
+(or Ayatana). `pactl` is used for ducking.
+
+## Wire it into Claude Code
+
+Add a **Stop hook** to `~/.claude/settings.json` so every finished reply is spoken
+(see [FLOW.md](FLOW.md) for the exact JSON). The hook fails silently when the
+daemon is off, so it costs nothing when you don't want voice.
+
+## Use
 
 ```bash
-jarvis on
+murmur on              # start the daemon (voice on)
+murmur tray            # taskbar icon
+murmur hotkey-install  # Ctrl+Alt+Space = pause/resume (Cinnamon)
+
+murmur voices          # audition voices out loud
+murmur voice am_adam   # set the voice
+murmur speed 1.15      # set the pace
+murmur duck 20         # music volume % while speaking
+
+murmur pause | resume | toggle | skip | status
+murmur off             # voice off
 ```
 
-## Requirements
+Not autostarted by default. Run `murmur on` after boot. To start automatically,
+copy `autostart/murmur-tray.desktop` into `~/.config/autostart/` and add a second
+entry (or a line) that runs `murmur on` — the tray controls the daemon but does
+not launch it for you.
 
-- Python 3.12 with `kokoro`, `sounddevice`, `soundfile`, `numpy` installed for the
-  user (not a venv — the daemon runs as your login user so audio reaches the
-  default sink).
-- A working audio output (PulseAudio / PipeWire). Check `pactl get-default-sink`.
-- GPU optional but intended; Kokoro will use it if present.
+See [FLOW.md](FLOW.md) for architecture, the socket protocol, and troubleshooting.
 
-## Commands
+## License
 
-```
-jarvis on        # start daemon (idempotent)
-jarvis off       # kill daemon — voice off, hook no-ops
-jarvis say TEXT  # speak arbitrary text
-jarvis hush      # cut current playback + clear queue
-jarvis status    # running | stopped
-```
-
-## Notes
-
-- **Not autostarted on purpose.** Run `jarvis on` after boot when you want voice.
-- Env overrides: `JARVIS_VOICE` (default `am_michael`), `JARVIS_SPEED` (default `1.10`).
-- Daemon log: `~/.cache/jarvisd.log`.
+MIT.
