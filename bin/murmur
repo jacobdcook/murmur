@@ -72,8 +72,8 @@ $v speaking. $LINE"
         done
         echo "Pick one, then: murmur voice <name>"
         ;;
-    tray)     nohup "$SELF_DIR/murmur-tray" >>"$LOG" 2>&1 & disown; echo "tray launched" ;;
-    bar)      nohup "$SELF_DIR/murmur-bar" >>"$LOG" 2>&1 & disown; echo "bar launched" ;;
+    tray)     pkill -f '/murmur-tray$' 2>/dev/null; setsid "$SELF_DIR/murmur-tray" >>"$LOG" 2>&1 < /dev/null & echo "tray launched" ;;
+    bar)      pkill -f '/murmur-bar$' 2>/dev/null; setsid "$SELF_DIR/murmur-bar" >>"$LOG" 2>&1 < /dev/null & echo "bar launched" ;;
     hotkey-install)
         # bind Ctrl+Alt+Space -> murmur toggle  (Cinnamon)
         BIN="$(command -v murmur || echo "$SELF_DIR/murmur")"
