@@ -57,6 +57,11 @@ case "$1" in
             python3 -c "import socket;s=socket.socket(socket.AF_UNIX,socket.SOCK_STREAM);s.settimeout(2);s.connect('$SOCK');s.sendall(b'__STATUS__');s.shutdown(socket.SHUT_WR);print(s.recv(4096).decode().strip());s.close()"
         else echo '{"state":"stopped"}'; fi
         ;;
+    clips)    python3 -c "import socket,json;s=socket.socket(socket.AF_UNIX,socket.SOCK_STREAM);s.settimeout(2);s.connect('$SOCK');s.sendall(b'__CLIPS__');s.shutdown(socket.SHUT_WR);print('\n\n'.join(json.loads(s.recv(65536).decode())));s.close()" ;;
+    clips-copy)
+        python3 -c "import socket,json;s=socket.socket(socket.AF_UNIX,socket.SOCK_STREAM);s.settimeout(2);s.connect('$SOCK');s.sendall(b'__CLIPS__');s.shutdown(socket.SHUT_WR);print('\n\n'.join(json.loads(s.recv(65536).decode())),end='');s.close()" | { command -v xclip >/dev/null && xclip -selection clipboard || xsel -b; } && echo "interrupted text copied to clipboard"
+        ;;
+    clips-clear) send "__CLEAR_CLIPS__"; echo "cleared" ;;
     voice)    shift; cfg_set voice "\"$1\"" ;;
     speed)    shift; cfg_set speed "$1" ;;
     duck)     shift; cfg_set duck "$1" ;;
@@ -101,7 +106,10 @@ usage: murmur <command>
   say <text>          speak text
   pause | resume      pause / resume playback
   toggle              toggle pause (used by the hotkey + bar)
-  hush | skip         stop current + clear the queue
+  hush | skip         stop current + clear the queue (captures spoken text)
+  clips               print interrupted text captured so far
+  clips-copy          copy interrupted text to the clipboard
+  clips-clear         clear the interrupted-text buffer
   status              JSON state
   voice <name>        set default voice (persists)
   speed <x>           set speed, e.g. 1.10

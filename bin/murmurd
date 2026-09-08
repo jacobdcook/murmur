@@ -17,13 +17,17 @@ Socket protocol (connect, send UTF-8, close):
   __STOP__              -> skip current utterance + clear the queue
   __STATUS__            -> daemon writes back one JSON line, then closes
 """
+import faulthandler
 import json
 import os
 import queue
+import signal
 import re
 import socket
 import subprocess
+import tempfile
 import threading
+import time
 
 SOCK = "/tmp/murmur.sock"
 CONFIG = os.path.expanduser("~/.config/murmur/config.json")
@@ -31,6 +35,8 @@ SAMPLE_RATE = 24_000
 MAX_CHARS = 6000
 
 DEFAULTS = {"voice": "am_michael", "speed": 1.10, "duck": 25}
+
+faulthandler.register(signal.SIGUSR1)  # kill -USR1 <pid> dumps all thread stacks
 
 
 def load_config():
@@ -43,12 +49,51 @@ def load_config():
     return cfg
 
 
+def _sentences(text):
+    """Split into sentence-ish chunks for streaming + accurate capture."""
+    parts = re.split(r"(?<=[.!?:])\s+|\n+", text)
+    return [p.strip() for p in parts if p.strip()]
+
+
+def _force_full_volume():
+    """Our own playback must not stay stuck at a low volume that PulseAudio's
+    stream-restore remembered from a previous ducking. Unmute + set 100%."""
+    import time as _t
+    for _ in range(12):
+        try:
+            raw = subprocess.run(
+                ["pactl", "list", "sink-inputs"],
+                capture_output=True, text=True, timeout=2,
+            ).stdout
+        except Exception:
+            return
+        sid = None
+        for line in raw.splitlines():
+            m = re.match(r"Sink Input #(\d+)", line)
+            if m:
+                sid = m.group(1)
+            elif 'application.name = "Murmur"' in line and sid:
+                subprocess.run(["pactl", "set-sink-input-mute", sid, "0"],
+                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                subprocess.run(["pactl", "set-sink-input-volume", sid, "100%"],
+                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                return
+        _t.sleep(0.05)
+
+
 print("murmurd: loading Kokoro…", flush=True)
+# CPU-only: Kokoro-82M is ~3x realtime on CPU, and this avoids stalling on a GPU
+# shared with ollama / Whisper (which can wedge synth when VRAM is tight).
+os.environ["CUDA_VISIBLE_DEVICES"] = ""
 from kokoro import KPipeline
 import numpy as np
-import sounddevice as sd
+import soundfile as sf
 
 pipe = KPipeline(lang_code="a")
+
+# Playback goes through `paplay` to the PulseAudio DEFAULT sink, so it always
+# follows whatever output the user is on right now (AirPods, open comms, USB,
+# onboard) with no device pinning.
 
 
 # ── music ducking ─────────────────────────────────────────────────────────
@@ -74,11 +119,15 @@ class Ducker:
             if m:
                 if cur:
                     out.append(cur)
-                cur = {"id": m.group(1), "pid": None, "vol": None}
+                cur = {"id": m.group(1), "pid": None, "vol": None, "app": ""}
             elif "application.process.id" in line:
                 mm = re.search(r'"(\d+)"', line)
                 if mm:
                     cur["pid"] = mm.group(1)
+            elif "application.name" in line:
+                mm = re.search(r'= "(.*)"', line)
+                if mm:
+                    cur["app"] = mm.group(1)
             elif line.strip().startswith("Volume:") and cur.get("vol") is None:
                 mm = re.search(r"(\d+)%", line)
                 if mm:
@@ -89,6 +138,9 @@ class Ducker:
 
     def duck(self, pct):
         for si in self._sink_inputs():
+            # never duck our own speech (paplay named "Murmur")
+            if si.get("app") == "Murmur":
+                continue
             if si["pid"] == self.pid or si["id"] in self.saved:
                 continue
             if si["vol"] is None:
@@ -119,12 +171,12 @@ class Engine:
     def __init__(self):
         self.q = queue.Queue()
         self.lock = threading.Lock()
-        self.buf = None
-        self.pos = 0
         self.paused = False
         self.skip = False
         self.speaking = False
         self.current = ""
+        self.spoken = []      # text segments spoken in the current utterance
+        self.clips = []       # interrupted text, accumulated across skips
         self.ducker = Ducker()
         threading.Thread(target=self._worker, daemon=True).start()
 
@@ -132,41 +184,42 @@ class Engine:
     def enqueue(self, text, voice=None):
         self.q.put((text, voice))
 
-    def _beep(self, freq):
-        try:
-            t = np.linspace(0, 0.10, int(SAMPLE_RATE * 0.10), False)
-            tone = (0.18 * np.sin(2 * np.pi * freq * t)).astype("float32")
-            sd.play(tone, SAMPLE_RATE)
-        except Exception:
-            pass
-
     def pause(self):
         with self.lock:
             self.paused = True
-        self._beep(330)   # low blip = paused
 
     def resume(self):
         with self.lock:
             self.paused = False
-        self._beep(660)   # high blip = resumed
 
     def toggle(self):
         with self.lock:
             self.paused = not self.paused
-            p = self.paused
-        self._beep(330 if p else 660)
-        return p
+            return self.paused
 
     def stop(self):
-        # skip current utterance and drop the whole queue
+        # skip current utterance and drop the whole queue.
+        # capture what was spoken so far — if you interrupted, you wanted it.
         try:
             while True:
                 self.q.get_nowait()
         except queue.Empty:
             pass
         with self.lock:
+            if self.speaking:
+                clip = " ".join(self.spoken).strip() or self.current
+                if clip:
+                    self.clips.append(clip)
             self.skip = True
             self.paused = False
+
+    def get_clips(self):
+        with self.lock:
+            return list(self.clips)
+
+    def clear_clips(self):
+        with self.lock:
+            self.clips.clear()
 
     def status(self):
         with self.lock:
@@ -175,44 +228,37 @@ class Engine:
                 "state": state,
                 "queued": self.q.qsize(),
                 "text": self.current[:120],
+                "clips": len(self.clips),
             }
 
     # internals
-    def _callback(self, outdata, frames, time_info, status):
-        with self.lock:
-            if self.skip or self.buf is None:
-                outdata[:] = 0
-                raise sd.CallbackStop
-            if self.paused:
-                outdata[:] = 0
-                return
-            end = self.pos + frames
-            chunk = self.buf[self.pos:end]
-            n = len(chunk)
-            outdata[:n, 0] = chunk
-            if n < frames:
-                outdata[n:, 0] = 0
-                self.pos = len(self.buf)
-                raise sd.CallbackStop
-            self.pos = end
-
     def _play(self, audio):
+        """Play one audio chunk to the default PulseAudio sink via paplay.
+        Follows the user's current output device; interruptible by skip."""
         if hasattr(audio, "detach"):  # torch.Tensor -> numpy
             audio = audio.detach().cpu().numpy()
         audio = np.asarray(audio, dtype="float32").reshape(-1)
-        with self.lock:
-            self.buf = audio
-            self.pos = 0
-        done = threading.Event()
-        stream = sd.OutputStream(
-            samplerate=SAMPLE_RATE, channels=1,
-            callback=self._callback,
-            finished_callback=done.set,
-        )
-        with stream:
-            done.wait()
-        with self.lock:
-            self.buf = None
+        path = tempfile.mktemp(suffix=".wav")
+        try:
+            sf.write(path, audio, SAMPLE_RATE)
+            proc = subprocess.Popen(
+                ["paplay", "--property=application.name=Murmur", path],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            )
+            threading.Thread(target=_force_full_volume, daemon=True).start()
+            while proc.poll() is None:
+                with self.lock:
+                    if self.skip:
+                        proc.terminate()
+                        break
+                time.sleep(0.05)
+        except Exception as e:
+            print(f"murmurd: play error: {e}", flush=True)
+        finally:
+            try:
+                os.unlink(path)
+            except Exception:
+                pass
 
     def _worker(self):
         while True:
@@ -224,14 +270,26 @@ class Engine:
                 self.skip = False
                 self.speaking = True
                 self.current = text
+                self.spoken = []
             try:
                 self.ducker.duck(cfg["duck"])
-                for _, _, audio in pipe(text, voice=voice, speed=speed):
+                for sentence in _sentences(text):
+                    # honor pause at each sentence boundary (hold-to-pause)
+                    while True:
+                        with self.lock:
+                            if self.skip or not self.paused:
+                                break
+                        time.sleep(0.05)
                     with self.lock:
                         if self.skip:
                             break
-                    if audio is not None and len(audio):
-                        self._play(audio)
+                        self.spoken.append(sentence)
+                    for _, _, audio in pipe(sentence, voice=voice, speed=speed):
+                        with self.lock:
+                            if self.skip:
+                                break
+                        if audio is not None and len(audio):
+                            self._play(audio)
             except Exception as e:
                 print(f"murmurd: playback error: {e}", flush=True)
             finally:
@@ -280,7 +338,19 @@ while True:
         conn.close()
         continue
 
+    if text == "__CLIPS__":
+        try:
+            conn.sendall((json.dumps(engine.get_clips()) + "\n").encode())
+        except Exception:
+            pass
+        conn.close()
+        continue
+
     conn.close()
+
+    if text == "__CLEAR_CLIPS__":
+        engine.clear_clips()
+        continue
 
     if text == "__PAUSE__":
         engine.pause()
