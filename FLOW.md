@@ -114,11 +114,19 @@ the daemon sees end-of-input before it replies.
 `async: true` so synthesis never blocks the next prompt. After editing settings
 mid-session, open `/hooks` once or restart Claude Code so the watcher reloads.
 
-## Global hotkey
+## Hold-to-pause hotkey
 
-`murmur hotkey-install` registers a Cinnamon custom keybinding
-(`Ctrl+Alt+Space` -> `murmur toggle`). On other desktops, bind that command to any
-key via your DE's keyboard settings — `murmur toggle` is all it runs.
+`murmur hotkey-install` (or `murmur hold`) starts `murmur-hold`, a small pynput
+listener. **Hold `Ctrl+I`** -> pause; **release** -> resume. It's momentary, the
+same feel as a push-to-talk key, so you can hold it while you reply out loud and
+let go to keep listening. A low beep = paused, high beep = resumed.
+
+A desktop keybinding can only fire on key *press*, so hold/release needs the
+listener. `murmur toggle` (tap to flip) is still available if you'd rather bind a
+single key in your DE settings.
+
+Caveat: `Ctrl+I` is the terminal Tab control code, so holding it while a terminal
+is focused also emits tabs. Pause/resume works regardless of focus.
 
 ## Troubleshooting
 

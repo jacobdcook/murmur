@@ -74,26 +74,24 @@ $v speaking. $LINE"
         ;;
     tray)     pkill -f '/murmur-tray$' 2>/dev/null; setsid "$SELF_DIR/murmur-tray" >>"$LOG" 2>&1 < /dev/null & echo "tray launched" ;;
     bar)      pkill -f '/murmur-bar$' 2>/dev/null; setsid "$SELF_DIR/murmur-bar" >>"$LOG" 2>&1 < /dev/null & echo "bar launched" ;;
+    hold)     pkill -f '/murmur-hold$' 2>/dev/null; setsid "$SELF_DIR/murmur-hold" >>"$LOG" 2>&1 < /dev/null & echo "hold listener started (hold Ctrl+I to pause)" ;;
     hotkey-install)
-        # bind Ctrl+Alt+Space -> murmur toggle  (Cinnamon)
-        BIN="$(command -v murmur || echo "$SELF_DIR/murmur")"
-        python3 - "$BIN" <<'EOF'
-import subprocess, sys, ast
-BIN = sys.argv[1]
+        # remove any old Ctrl+Alt+Space tap binding, start the hold listener
+        python3 - <<'EOF'
+import subprocess, ast
 G = "org.cinnamon.desktop.keybindings"
-def get(k): return subprocess.check_output(["gsettings","get",G,k]).decode().strip()
-lst = ast.literal_eval(get("custom-list"))
-name = "murmur-toggle"
-if name not in lst:
-    lst = [x for x in lst if x != "__dummy__"] + [name, "__dummy__"]
-    subprocess.run(["gsettings","set",G,"custom-list",str(lst)])
-path = f"custom-keybindings/{name}/"
-S = f"{G}.custom-keybinding:/org/cinnamon/desktop/keybindings/{path}"
-subprocess.run(["gsettings","set",S,"name","Murmur toggle pause"])
-subprocess.run(["gsettings","set",S,"command",f"{BIN} toggle"])
-subprocess.run(["gsettings","set",S,"binding","['<Control><Alt>space']"])
-print("bound Ctrl+Alt+Space -> murmur toggle")
+try:
+    lst = ast.literal_eval(subprocess.check_output(["gsettings","get",G,"custom-list"]).decode().strip())
+    if "murmur-toggle" in lst:
+        lst = [x for x in lst if x != "murmur-toggle"]
+        subprocess.run(["gsettings","set",G,"custom-list",str(lst)])
+        print("removed old Ctrl+Alt+Space tap binding")
+except Exception:
+    pass
 EOF
+        pkill -f '/murmur-hold$' 2>/dev/null
+        setsid "$SELF_DIR/murmur-hold" >>"$LOG" 2>&1 < /dev/null &
+        echo "hold-to-pause active: hold Ctrl+I to pause, release to resume"
         ;;
     *)
         cat <<EOF
@@ -111,7 +109,8 @@ usage: murmur <command>
   voices [line]       sample every candidate voice out loud
   tray                launch the taskbar tray icon (recommended)
   bar                 launch the always-on-top mini bar (alternative)
-  hotkey-install      bind Ctrl+Alt+Space -> toggle (Cinnamon)
+  hold                start the hold-to-pause listener (hold Ctrl+I)
+  hotkey-install      remove old tap binding + start hold-to-pause
 EOF
         ;;
 esac

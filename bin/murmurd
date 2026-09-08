@@ -132,18 +132,30 @@ class Engine:
     def enqueue(self, text, voice=None):
         self.q.put((text, voice))
 
+    def _beep(self, freq):
+        try:
+            t = np.linspace(0, 0.10, int(SAMPLE_RATE * 0.10), False)
+            tone = (0.18 * np.sin(2 * np.pi * freq * t)).astype("float32")
+            sd.play(tone, SAMPLE_RATE)
+        except Exception:
+            pass
+
     def pause(self):
         with self.lock:
             self.paused = True
+        self._beep(330)   # low blip = paused
 
     def resume(self):
         with self.lock:
             self.paused = False
+        self._beep(660)   # high blip = resumed
 
     def toggle(self):
         with self.lock:
             self.paused = not self.paused
-            return self.paused
+            p = self.paused
+        self._beep(330 if p else 660)
+        return p
 
     def stop(self):
         # skip current utterance and drop the whole queue

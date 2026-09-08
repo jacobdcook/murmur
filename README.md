@@ -19,7 +19,9 @@ spoken conversation loop with your terminal.
 - **Music ducking** — lowers every other PulseAudio/PipeWire stream to 25% while
   speaking, restores it when done.
 - **Real pause / resume** — not just stop. Hold a thought, reply, resume.
-- **Global hotkey** — `Ctrl+Alt+Space` toggles pause (Cinnamon; scriptable).
+- **Hold-to-pause hotkey** — hold `Ctrl+I` to pause, release to resume
+  (momentary, like a push-to-talk key). A low/high beep confirms pause/resume so
+  you don't need to look.
 - **Taskbar tray icon** — live state + a menu for pause/skip/voice switching,
   like a media applet. (An always-on-top mini bar is included as an alternative.)
 - **Voice auditioning** — `murmur voices` speaks a sample line in each candidate
@@ -49,7 +51,8 @@ daemon is off, so it costs nothing when you don't want voice.
 ```bash
 murmur on              # start the daemon (voice on)
 murmur tray            # taskbar icon
-murmur hotkey-install  # Ctrl+Alt+Space = pause/resume (Cinnamon)
+murmur hotkey-install  # hold Ctrl+I = pause/resume
+murmur bar             # visible always-on-top control strip (top-left)
 
 murmur voices          # audition voices out loud
 murmur voice am_adam   # set the voice
